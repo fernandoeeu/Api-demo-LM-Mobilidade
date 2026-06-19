@@ -5,7 +5,7 @@ A Webmotors fica atrás do PerimeterX. curl/fetch puro com cookie copiado cai
 em 401/403 porque o token `_px3` é emitido por uma sessão de navegador real e
 amarrado ao fingerprint + IP. Este módulo resolve isso assim:
 
-    1. MINT  -> abre o Chrome REAL (headed) via agent-browser com stealth,
+    1. MINT  -> abre o Chrome REAL (headed) via Playwright com stealth,
                 deixa o sensor PerimeterX rodar (e resolve o press-and-hold
                 "Pressione e segure" se ele aparecer), e colhe os cookies
                 `_px3`, `_pxvid`, `pxcts`, `_pxde` + User-Agent.
@@ -17,8 +17,8 @@ amarrado ao fingerprint + IP. Este módulo resolve isso assim:
 Validado: 40/40 hits no detail + 12/12 carros distintos a partir da busca.
 
 Dependências de runtime:
-    - agent-browser (npm i -g agent-browser && agent-browser install)
     - Google Chrome instalado
+    - playwright
     - requests
 
 Bypass do browser: se você já tem cookies válidos, exporte
@@ -31,8 +31,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -41,23 +39,15 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Page, sync_playwright
 
 # ==========================================
 # Configuração (tudo sobrescrevível por env)
 # ==========================================
 
-# Binário do agent-browser. No Windows o npm instala um shim `.cmd`, e o
-# subprocess (shell=False) só resolve `.exe` no PATH — então achamos o caminho
-# completo (com extensão, via PATHEXT) com shutil.which. Em macOS/Linux devolve
-# o launcher normal. Com o caminho completo de um `.cmd`/`.bat`, o subprocess o
-# lança pelo shell do sistema automaticamente.
-AGENT_BROWSER = (
-    os.getenv("AGENT_BROWSER_BIN") or shutil.which("agent-browser") or "agent-browser"
-)
-
-
 def _default_chrome_path() -> str:
-    """Caminho do Chrome real por SO — o 1º que existir, senão o default do SO.
+    """Caminho do Chrome real por SO, o 1º que existir, senão o default do SO.
 
     O mint precisa do Chrome de verdade (o fingerprint tem que ser o do binário
     real). Sobrescrevível por WEBMOTORS_CHROME_PATH.
@@ -84,7 +74,7 @@ CHROME_PATH = os.getenv("WEBMOTORS_CHROME_PATH") or _default_chrome_path()
 
 
 def _default_user_agent() -> str:
-    """UA coerente com o SO real — o PerimeterX cruza o UA com o fingerprint,
+    """UA coerente com o SO real. O PerimeterX cruza o UA com o fingerprint,
     então um UA de Mac rodando no Windows é um tell. Sobrescrevível por
     WEBMOTORS_UA. No bypass por cookie, use o UA do navegador onde colheu os
     cookies.
@@ -101,10 +91,10 @@ def _default_user_agent() -> str:
     )
 
 
-DEFAULT_UA = os.getenv("WEBMOTORS_UA") or _default_user_agent()
+USER_AGENT_OVERRIDE = os.getenv("WEBMOTORS_UA")
+DEFAULT_UA = USER_AGENT_OVERRIDE or _default_user_agent()
 
 BASE_URL = "https://www.webmotors.com.br"
-SESSION_NAME = os.getenv("WEBMOTORS_SESSION", "wm-scraper")
 PROFILE_DIR = os.getenv(
     "WEBMOTORS_PROFILE_DIR",
     str(Path(tempfile.gettempdir()) / "wm-scraper-profile"),
@@ -180,59 +170,34 @@ class WebmotorsSession:
 
 
 # ==========================================
-# agent-browser: helpers de subprocess
+# Playwright: helpers de browser
 # ==========================================
 
-def _ab(args: list[str], *, session: str, timeout: int = 60) -> subprocess.CompletedProcess:
-    """Roda um comando agent-browser numa sessão e devolve o CompletedProcess."""
-    return subprocess.run(
-        [AGENT_BROWSER, "--session", session, *args],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+def _is_blocked(page: Page) -> bool:
+    marker = f"{page.title()}\n{page.locator('body').inner_text(timeout=5000)[:5000]}".lower()
+    return "denied" in marker or "acesso negado" in marker or "pressione e segure" in marker
 
 
-def _ab_eval(expr: str, *, session: str) -> str:
-    out = _ab(["eval", expr], session=session).stdout.strip()
-    # agent-browser imprime a string entre aspas; remove se for o caso.
-    if len(out) >= 2 and out[0] == '"' and out[-1] == '"':
-        return json.loads(out)
-    return out
-
-
-def _ab_get_cookies(*, session: str) -> list[dict[str, Any]]:
-    out = _ab(["cookies", "get", "--json"], session=session).stdout
-    try:
-        return json.loads(out)["data"]["cookies"]
-    except (json.JSONDecodeError, KeyError):
-        return []
-
-
-def _is_blocked(*, session: str) -> bool:
-    title = _ab(["get", "title"], session=session).stdout.lower()
-    return "denied" in title or "acesso negado" in title or "pressione e segure" in title
-
-
-def _solve_press_and_hold(*, session: str, attempts: int = 3) -> bool:
+def _solve_press_and_hold(page: Page, *, attempts: int = 3) -> bool:
     """Resolve o captcha "Pressione e segure" segurando o mouse no botão.
 
     O botão fica centralizado horizontalmente e ~57px abaixo do centro
-    vertical (card de tamanho fixo, centralizado na viewport fixa). Eventos
-    de mouse via CDP são em nível de browser e ignoram os hooks de geometria
-    que o PerimeterX coloca no iframe.
+    vertical (card de tamanho fixo, centralizado na viewport fixa).
     """
     for i in range(attempts):
-        hold_ms = 7000 + i * 1500  # vai segurando mais a cada tentativa
-        _ab(["mouse", "move", str(_BUTTON_X), str(_BUTTON_Y)], session=session)
-        _ab(["wait", "400"], session=session)
-        _ab(["mouse", "down"], session=session)
-        _ab(["wait", str(hold_ms)], session=session, timeout=hold_ms // 1000 + 20)
-        _ab(["mouse", "up"], session=session)
-        _ab(["wait", "4000"], session=session)
-        if not _is_blocked(session=session):
+        hold_seconds = 7 + i * 1.5
+        box = page.locator("#px-captcha").bounding_box(timeout=5000)
+        x = (box["x"] + box["width"] / 2) if box else _BUTTON_X
+        y = (box["y"] + box["height"] / 2) if box else _BUTTON_Y
+        page.mouse.move(x, y)
+        time.sleep(0.4)
+        page.mouse.down()
+        time.sleep(hold_seconds)
+        page.mouse.up()
+        time.sleep(4)
+        if not _is_blocked(page):
             return True
-    return not _is_blocked(session=session)
+    return not _is_blocked(page)
 
 
 # ==========================================
@@ -257,57 +222,58 @@ def mint_session(*, headless: bool = False, verbose: bool = True) -> WebmotorsSe
         if verbose:
             print(f"[mint] {msg}", file=sys.stderr)
 
-    stealth_file = Path(tempfile.gettempdir()) / "wm-stealth.js"
-    stealth_file.write_text(_STEALTH_JS)
+    try:
+        log("lançando Chrome real via Playwright...")
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=PROFILE_DIR,
+                executable_path=CHROME_PATH if os.path.exists(CHROME_PATH) else None,
+                headless=headless,
+                viewport={"width": VIEWPORT[0], "height": VIEWPORT[1]},
+                locale="pt-BR",
+                user_agent=USER_AGENT_OVERRIDE,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.add_init_script(_STEALTH_JS)
+                page.goto(BASE_URL, wait_until="domcontentloaded")
+                time.sleep(3)
 
-    launch = [
-        "--executable-path", CHROME_PATH,
-        "--user-agent", DEFAULT_UA,
-        "--init-script", str(stealth_file),
-        "--profile", PROFILE_DIR,
-    ]
-    if not headless:
-        launch.append("--headed")
+                if _is_blocked(page):
+                    log("press-and-hold detectado, resolvendo...")
+                    if not _solve_press_and_hold(page):
+                        raise WebmotorsBlocked("não consegui resolver o press-and-hold do PerimeterX")
+                    log("captcha resolvido.")
+                else:
+                    log("passou direto (sem captcha).")
 
-    # Fecha sessão anterior e sobe limpa na viewport fixa antes de navegar.
-    _ab(["close"], session=SESSION_NAME)
-    log("lançando Chrome real...")
-    _ab(["open", *launch], session=SESSION_NAME)
-    _ab(["set", "viewport", str(VIEWPORT[0]), str(VIEWPORT[1])], session=SESSION_NAME)
-    _ab(["open", BASE_URL], session=SESSION_NAME)
-    _ab(["wait", "--load", "domcontentloaded"], session=SESSION_NAME)
-    _ab(["wait", "3000"], session=SESSION_NAME)
+                cookies: dict[str, str] = {}
+                for _ in range(8):
+                    raw = context.cookies()
+                    cookies = {
+                        c["name"]: c["value"]
+                        for c in raw
+                        if "webmotors.com.br" in c.get("domain", "")
+                    }
+                    if cookies.get("_px3"):
+                        break
+                    time.sleep(1.5)
 
-    if _is_blocked(session=SESSION_NAME):
-        log("press-and-hold detectado, resolvendo...")
-        if not _solve_press_and_hold(session=SESSION_NAME):
-            raise WebmotorsBlocked("não consegui resolver o press-and-hold do PerimeterX")
-        log("captcha resolvido.")
-    else:
-        log("passou direto (sem captcha).")
+                if not cookies.get("_px3"):
+                    raise WebmotorsBlocked("sessão sem _px3 após o mint")
 
-    # Espera o sensor PerimeterX emitir o _px3.
-    cookies: dict[str, str] = {}
-    for _ in range(8):
-        raw = _ab_get_cookies(session=SESSION_NAME)
-        cookies = {
-            c["name"]: c["value"]
-            for c in raw
-            if "webmotors.com.br" in c.get("domain", "")
-        }
-        if cookies.get("_px3"):
-            break
-        _ab(["wait", "1500"], session=SESSION_NAME)
-
-    if not cookies.get("_px3"):
-        raise WebmotorsBlocked("sessão sem _px3 após o mint")
-
-    log(f"colhi {len(cookies)} cookies (_px3 ok).")
-    return WebmotorsSession(cookies=cookies, user_agent=DEFAULT_UA)
+                user_agent = USER_AGENT_OVERRIDE or page.evaluate("navigator.userAgent")
+                log(f"colhi {len(cookies)} cookies (_px3 ok).")
+                return WebmotorsSession(cookies=cookies, user_agent=user_agent)
+            finally:
+                context.close()
+    except PlaywrightError as exc:
+        raise WebmotorsBlocked(f"falha ao abrir/controlar o Chrome via Playwright: {exc}") from exc
 
 
 def close_browser() -> None:
-    _ab(["close"], session=SESSION_NAME)
+    return None
 
 
 # ==========================================
@@ -511,16 +477,12 @@ def _main(argv: list[str]) -> int:
         print(json.dumps({"cookies": list(sess.cookies), "user_agent": sess.user_agent}, indent=2))
     elif args.cmd == "search":
         data = client.search(make=args.marca, model=args.modelo, page=args.page, per_page=args.per_page)
-        rows = [
-            normalize_detail({"Specification": it["Specification"], "Prices": it["Prices"], "UniqueId": it["UniqueId"]})
-            for it in data.get("SearchResults", [])
-        ]
-        print(json.dumps({"count": data.get("Count"), "results": rows}, ensure_ascii=False, indent=2))
+        print(json.dumps(data, ensure_ascii=False, indent=2))
     elif args.cmd == "detail":
         details = client.iter_details(make=args.marca, model=args.modelo, pages=args.pages, per_page=args.per_page)
-        print(json.dumps([normalize_detail(d) for d in details], ensure_ascii=False, indent=2))
+        print(json.dumps(details, ensure_ascii=False, indent=2))
     elif args.cmd == "url":
-        print(json.dumps(normalize_detail(client.get_detail(url=args.url)), ensure_ascii=False, indent=2))
+        print(json.dumps(client.get_detail(url=args.url), ensure_ascii=False, indent=2))
     return 0
 
 

@@ -184,7 +184,7 @@ def webmotors_cookie_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     mint_session() checks os.getenv("WEBMOTORS_COOKIE") first; when set it
     parses the cookie string and returns a WebmotorsSession without touching
-    subprocess or Chrome.
+    Playwright or Chrome.
     """
     monkeypatch.setenv(
         "WEBMOTORS_COOKIE",

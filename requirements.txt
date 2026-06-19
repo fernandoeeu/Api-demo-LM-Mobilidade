@@ -3,3 +3,4 @@ uvicorn
 tavily-python
 python-dotenv
 requests
+playwright

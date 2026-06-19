@@ -246,16 +246,9 @@ def webmotors_search(
     except wm.WebmotorsBlocked as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    anuncios = [
-        wm.normalize_detail({
-            "Specification": it["Specification"],
-            "Prices": it["Prices"],
-            "UniqueId": it["UniqueId"],
-        })
-        for it in data.get("SearchResults", [])
-        if it.get("UniqueId", 0) > 0
-    ]
-    medias = calcular_medias(anuncios)
+    anuncios = data.get("SearchResults", [])
+    anuncios_normalizados = [wm.normalize_detail(it) for it in anuncios]
+    medias = calcular_medias(anuncios_normalizados)
 
     return {
         "marca": marca,
@@ -266,6 +259,7 @@ def webmotors_search(
         "media_preco": medias["media_preco"],
         "media_km": medias["media_km"],
         "anuncios": anuncios,
+        "payload_completo": data,
     }
 
 
@@ -284,16 +278,16 @@ def webmotors_detail(
     except wm.WebmotorsBlocked as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    anuncios = [wm.normalize_detail(d) for d in details]
-    medias = calcular_medias(anuncios)
+    anuncios_normalizados = [wm.normalize_detail(d) for d in details]
+    medias = calcular_medias(anuncios_normalizados)
 
     return {
         "marca": marca,
         "modelo": modelo,
-        "total_anuncios": len(anuncios),
+        "total_anuncios": len(details),
         "media_preco": medias["media_preco"],
         "media_km": medias["media_km"],
-        "anuncios": anuncios,
+        "anuncios": details,
     }
 
 
@@ -304,7 +298,7 @@ def webmotors_detail_by_url(url: str):
         detail = get_webmotors_client().get_detail(url=url)
     except wm.WebmotorsBlocked as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    return wm.normalize_detail(detail)
+    return detail
 
 
 @app.post("/webmotors/refresh_session")

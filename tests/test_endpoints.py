@@ -118,6 +118,7 @@ def test_webmotors_search_200_shape(
     expected_keys = {
         "marca", "modelo", "page", "total_disponivel",
         "total_anuncios", "media_preco", "media_km", "anuncios",
+        "payload_completo",
     }
     assert expected_keys == set(data.keys())
 
@@ -127,22 +128,21 @@ def test_webmotors_search_200_shape(
     assert data["page"] == 1
     assert data["total_disponivel"] == search_payload["Count"]
 
-    # Endpoint filters to UniqueId > 0 (used cars only: 12 out of 15)
-    assert data["total_anuncios"] == 12
-    assert len(data["anuncios"]) == 12
+    # Endpoint returns the full SearchResults payload, including zero-km items.
+    assert data["total_anuncios"] == len(search_payload["SearchResults"])
+    assert len(data["anuncios"]) == len(search_payload["SearchResults"])
+    assert data["payload_completo"] == search_payload
 
     # Médias must be non-null (all 12 used items have prices)
     assert data["media_preco"] is not None
     assert data["media_km"] is not None
 
-    # Each normalized anuncio has the fields from normalize_detail
+    # Each anuncio is the full raw Webmotors listing, not the normalized subset.
     anuncio = data["anuncios"][0]
-    normalize_keys = {
-        "unique_id", "titulo", "marca", "modelo", "versao",
-        "ano_modelo", "ano_fabricacao", "km", "cor", "cambio",
-        "preco", "cidade", "estado",
-    }
-    assert normalize_keys == set(anuncio.keys())
+    assert anuncio == search_payload["SearchResults"][0]
+    assert "Specification" in anuncio
+    assert "Prices" in anuncio
+    assert "Media" in anuncio
 
 
 # ============================================================================
@@ -189,18 +189,16 @@ def test_webmotors_detail_200_shape_and_medias(
     # Price from fixture is 90000 — média must NOT be inflated 10×
     assert data["media_preco"] < 900_000, "media_preco inflated — _to_number may be mishandling the string"
 
-    # Each normalized anuncio has the full shape
+    # Each anuncio is the full raw /api/detail payload.
     anuncio = data["anuncios"][0]
-    normalize_keys = {
-        "unique_id", "titulo", "marca", "modelo", "versao",
-        "ano_modelo", "ano_fabricacao", "km", "cor", "cambio",
-        "preco", "cidade", "estado",
-    }
-    assert normalize_keys == set(anuncio.keys())
+    assert anuncio == detail_payload
+    assert "Specification" in anuncio
+    assert "Seller" in anuncio
+    assert "Prices" in anuncio
 
     # Seller fields from detail_payload must be present
-    assert anuncio["cidade"] == "Volta Redonda"
-    assert anuncio["estado"] == "Rio de Janeiro (RJ)"
+    assert anuncio["Seller"]["City"] == "Volta Redonda"
+    assert anuncio["Seller"]["State"] == "Rio de Janeiro (RJ)"
 
 
 # ============================================================================
@@ -217,7 +215,7 @@ def test_webmotors_detail_by_url_200(
     requests_mock: Any,
     detail_payload: dict[str, Any],
 ) -> None:
-    """GET /webmotors/detail_by_url returns 200 + normalized detail with cidade/estado."""
+    """GET /webmotors/detail_by_url returns 200 + full raw detail payload."""
     requests_mock.get(_DETAIL_BY_URL, json=detail_payload, status_code=200)
 
     resp = client.get(f"/webmotors/detail_by_url?url={_DETAIL_BY_URL}")
@@ -225,22 +223,15 @@ def test_webmotors_detail_by_url_200(
 
     data = resp.json()
 
-    # normalize_detail keys
-    expected_keys = {
-        "unique_id", "titulo", "marca", "modelo", "versao",
-        "ano_modelo", "ano_fabricacao", "km", "cor", "cambio",
-        "preco", "cidade", "estado",
-    }
-    assert expected_keys == set(data.keys())
-
-    assert data["unique_id"] == detail_payload["UniqueId"]
-    assert data["marca"] == "HONDA"
-    assert data["modelo"] == "CITY"
+    assert data == detail_payload
+    assert data["UniqueId"] == detail_payload["UniqueId"]
+    assert data["Specification"]["Make"]["Value"] == "HONDA"
+    assert data["Specification"]["Model"]["Value"] == "CITY"
     # Seller fields must be present (detail_payload has Seller)
-    assert data["cidade"] == "Volta Redonda"
-    assert data["estado"] == "Rio de Janeiro (RJ)"
+    assert data["Seller"]["City"] == "Volta Redonda"
+    assert data["Seller"]["State"] == "Rio de Janeiro (RJ)"
     # Price from detail fixture is string "90000" — must parse cleanly
-    assert data["preco"] == "90000"
+    assert data["Prices"]["Price"] == "90000"
 
 
 # ============================================================================
@@ -253,7 +244,7 @@ def test_webmotors_refresh_session_200(
 ) -> None:
     """POST /webmotors/refresh_session returns 200 + {ok, cookies, user_agent}."""
     # With WEBMOTORS_COOKIE set, ensure_session(force=True) takes the
-    # no-browser bypass and returns a WebmotorsSession without subprocess.
+    # no-browser bypass and returns a WebmotorsSession without Playwright.
     resp = client.post("/webmotors/refresh_session")
     assert resp.status_code == 200
 

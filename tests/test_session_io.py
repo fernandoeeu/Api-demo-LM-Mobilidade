@@ -11,7 +11,6 @@ Fixtures consumed from conftest.py:
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 
 import pytest
@@ -344,19 +343,19 @@ class TestMintSessionBypass:
         sess = mint_session()
         assert sess.is_fresh() is True
 
-    def test_bypass_does_not_invoke_subprocess(
+    def test_bypass_does_not_invoke_browser(
         self, webmotors_cookie_env: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """PROVE the Chrome branch is never taken: subprocess.run raises if called."""
+        """PROVE the Chrome branch is never taken: sync_playwright raises if called."""
 
         def explode(*args, **kwargs):  # noqa: ANN001, ANN202
             raise AssertionError(
-                "subprocess.run was called — Chrome branch taken unexpectedly"
+                "sync_playwright was called; Chrome branch taken unexpectedly"
             )
 
-        monkeypatch.setattr(subprocess, "run", explode)
+        monkeypatch.setattr(wm, "sync_playwright", explode)
 
-        # Must succeed without hitting subprocess.run
+        # Must succeed without opening Chrome
         sess = mint_session()
         assert sess is not None
         assert sess.cookies.get("_px3") == "x"
